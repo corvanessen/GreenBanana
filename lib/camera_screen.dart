@@ -23,7 +23,7 @@ class _CameraScreenState extends State<CameraScreen>
   bool _isTakingPhoto = false;
   String? _errorMessage;
   String? _capturedPhotoPath;
-  BananaColor? _photoColor;
+  ColorAnalysisResult? _photoColor;
 
   @override
   void initState() {
@@ -179,7 +179,7 @@ class _CameraScreenState extends State<CameraScreen>
       return _PhotoResultView(
         photoPath: _capturedPhotoPath!,
         detection: _detection,
-        color: _photoColor ?? BananaColor.unknown,
+        colorResult: _photoColor ?? ColorAnalysisResult.unknown(),
         onReset: _resetScan,
       );
     }
@@ -202,13 +202,13 @@ class _CameraScreenState extends State<CameraScreen>
 class _PhotoResultView extends StatelessWidget {
   final String photoPath;
   final DetectionResult? detection;
-  final BananaColor color;
+  final ColorAnalysisResult colorResult;
   final VoidCallback onReset;
 
   const _PhotoResultView({
     required this.photoPath,
     required this.detection,
-    required this.color,
+    required this.colorResult,
     required this.onReset,
   });
 
@@ -265,25 +265,7 @@ class _PhotoResultView extends StatelessWidget {
                 const SizedBox(height: 12),
 
                 // Kleur resultaat
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
-                  decoration: BoxDecoration(
-                    color: Colors.black.withValues(alpha: 0.5),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(
-                      color: _colorValue(color).withValues(alpha: 0.6),
-                      width: 1.5,
-                    ),
-                  ),
-                  child: Text(
-                    _colorLabel(color),
-                    style: TextStyle(
-                      color: _colorValue(color),
-                      fontSize: 16,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
+                _ColorResultCard(result: colorResult),
                 const SizedBox(height: 24),
 
                 // Nieuwe scan knop
@@ -662,6 +644,117 @@ Color _colorValue(BananaColor c) {
     case BananaColor.black:   return const Color(0xFF888888);
     case BananaColor.unknown: return const Color(0xFF555555);
   }
+}
+
+// ─── Kleur resultaat card ────────────────────────────────────────────────────
+
+class _ColorResultCard extends StatelessWidget {
+  final ColorAnalysisResult result;
+  const _ColorResultCard({required this.result});
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = result.primary;
+    final accentColor = _colorValue(primary);
+    final label = _colorLabel(primary);
+
+    // Build the segmented bar — only show segments with meaningful fraction
+    final segments = <_BarSegment>[
+      if (result.greenFraction > 0.02)
+        _BarSegment(fraction: result.greenFraction, color: const Color(0xFF66BB6A)),
+      if (result.yellowFraction > 0.02)
+        _BarSegment(fraction: result.yellowFraction, color: const Color(0xFFFFD600)),
+      if (result.blackFraction > 0.02)
+        _BarSegment(fraction: result.blackFraction, color: const Color(0xFF666666)),
+    ];
+
+    // Normalise fractions to fill the bar completely
+    final total = segments.fold(0.0, (s, seg) => s + seg.fraction);
+    final normSegments = total > 0
+        ? segments.map((s) => _BarSegment(fraction: s.fraction / total, color: s.color)).toList()
+        : segments;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.5),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: accentColor.withValues(alpha: 0.6), width: 1.5),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Primary label
+          Text(
+            label,
+            style: TextStyle(
+              color: accentColor,
+              fontSize: 16,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          // Only show the distribution bar when we have real data
+          if (result.primary != BananaColor.unknown && normSegments.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            // Percentage labels
+            Row(
+              children: [
+                if (result.greenFraction > 0.05)
+                  Expanded(
+                    flex: (result.greenFraction * 100).round(),
+                    child: Text(
+                      '${(result.greenFraction * 100).round()}% 🟢',
+                      style: const TextStyle(fontSize: 10, color: Color(0xFF66BB6A)),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                if (result.yellowFraction > 0.05)
+                  Expanded(
+                    flex: (result.yellowFraction * 100).round(),
+                    child: Text(
+                      '${(result.yellowFraction * 100).round()}% 🟡',
+                      style: const TextStyle(fontSize: 10, color: Color(0xFFFFD600)),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                if (result.blackFraction > 0.05)
+                  Expanded(
+                    flex: (result.blackFraction * 100).round(),
+                    child: Text(
+                      '${(result.blackFraction * 100).round()}% ⚫',
+                      style: const TextStyle(fontSize: 10, color: Color(0xFF888888)),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            // Segmented colour bar
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: SizedBox(
+                height: 8,
+                child: Row(
+                  children: normSegments
+                      .map((seg) => Expanded(
+                            flex: (seg.fraction * 1000).round(),
+                            child: Container(color: seg.color),
+                          ))
+                      .toList(),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _BarSegment {
+  final double fraction;
+  final Color color;
+  const _BarSegment({required this.fraction, required this.color});
 }
 
 // ─── Loading & error views ────────────────────────────────────────────────────

@@ -107,62 +107,105 @@ class BananaDetector {
     }
   }
 
-  Future<BananaColor> analyzePhotoColor(String imagePath) async {
+  Future<ColorAnalysisResult> analyzePhotoColor(String imagePath) async {
     try {
       final bytes = await File(imagePath).readAsBytes();
       final decoded = img.decodeImage(bytes);
-      if (decoded == null) return BananaColor.unknown;
+      if (decoded == null) return ColorAnalysisResult.unknown();
 
+      // Scan the central 40% of the image to avoid background
       final startX = (decoded.width * 0.30).toInt();
-      final endX = (decoded.width * 0.70).toInt();
+      final endX   = (decoded.width * 0.70).toInt();
       final startY = (decoded.height * 0.30).toInt();
-      final endY = (decoded.height * 0.70).toInt();
+      final endY   = (decoded.height * 0.70).toInt();
 
-      double totalHue = 0;
-      int validPixels = 0;
+      int greenPixels  = 0;
+      int yellowPixels = 0;
+      int blackPixels  = 0;
+      int validPixels  = 0;
 
-      for (int y = startY; y < endY; y += 8) {
-        for (int x = startX; x < endX; x += 8) {
+      for (int y = startY; y < endY; y += 6) {
+        for (int x = startX; x < endX; x += 6) {
           final pixel = decoded.getPixel(x, y);
           final r = pixel.r / 255.0;
           final g = pixel.g / 255.0;
           final b = pixel.b / 255.0;
 
-          final maxVal = [r, g, b].reduce((a, b) => a > b ? a : b);
-          final minVal = [r, g, b].reduce((a, b) => a < b ? a : b);
-          final delta = maxVal - minVal;
+          final maxVal = [r, g, b].reduce((a, c) => a > c ? a : c);
+          final minVal = [r, g, b].reduce((a, c) => a < c ? a : c);
+          final delta  = maxVal - minVal;
 
-          if (delta < 0.1 || maxVal < 0.15) continue;
+          // Skip near-black, near-white, and near-grey pixels
+          if (maxVal < 0.12 || delta < 0.06) continue;
 
+          // Compute HSV hue
           double hue = 0;
-          if (maxVal == r) {
-            hue = 60 * (((g - b) / delta) % 6);
-          } else if (maxVal == g) {
-            hue = 60 * (((b - r) / delta) + 2);
-          } else {
-            hue = 60 * (((r - g) / delta) + 4);
+          if (delta > 0) {
+            if (maxVal == r) {
+              hue = 60 * (((g - b) / delta) % 6);
+            } else if (maxVal == g) {
+              hue = 60 * (((b - r) / delta) + 2);
+            } else {
+              hue = 60 * (((r - g) / delta) + 4);
+            }
+            if (hue < 0) hue += 360;
           }
-          if (hue < 0) hue += 360;
 
           final sat = maxVal == 0 ? 0.0 : delta / maxVal;
-          if (sat < 0.25) continue;
-          if (!(hue >= 15 && hue <= 150)) continue;
 
-          totalHue += hue;
-          validPixels++;
+          // Only keep banana-spectrum hues (yellow-green range) and dark pixels
+          // Dark/brown pixels (overripe): low brightness regardless of hue
+          if (maxVal < 0.35 && sat < 0.5) {
+            blackPixels++;
+            validPixels++;
+            continue;
+          }
+
+          // Green banana: hue 70–150°, saturation can be modest (0.15+)
+          // Yellow banana: hue 30–70°, typically higher saturation
+          // We deliberately lower the saturation threshold for green
+          // because unripe bananas are often more muted in colour.
+          if (hue >= 15 && hue < 150 && sat >= 0.15) {
+            validPixels++;
+            if (hue >= 72) {
+              greenPixels++;
+            } else {
+              yellowPixels++;
+            }
+          }
         }
       }
 
-      if (validPixels < 10) return BananaColor.unknown;
+      if (validPixels < 15) return ColorAnalysisResult.unknown();
 
-      final avgHue = totalHue / validPixels;
-      if (avgHue < 40) return BananaColor.black;
-      if (avgHue < 75) return BananaColor.yellow;
-      return BananaColor.green;
+      // Pixel fractions
+      final totalColored = greenPixels + yellowPixels + blackPixels;
+      if (totalColored == 0) return ColorAnalysisResult.unknown();
+
+      final greenFrac  = greenPixels  / totalColored;
+      final yellowFrac = yellowPixels / totalColored;
+      final blackFrac  = blackPixels  / totalColored;
+
+      // Derive primary colour
+      BananaColor primary;
+      if (blackFrac > 0.45) {
+        primary = BananaColor.black;
+      } else if (greenFrac > 0.35) {
+        primary = BananaColor.green;
+      } else {
+        primary = BananaColor.yellow;
+      }
+
+      return ColorAnalysisResult(
+        primary: primary,
+        greenFraction:  greenFrac,
+        yellowFraction: yellowFrac,
+        blackFraction:  blackFrac,
+      );
 
     } catch (e) {
       debugPrint('⚠️ Kleuranalyse mislukt: $e');
-      return BananaColor.unknown;
+      return ColorAnalysisResult.unknown();
     }
   }
 
@@ -220,6 +263,28 @@ class _NamedLabel {
 }
 
 enum BananaColor { green, yellow, black, unknown }
+
+/// Holds the per-pixel colour breakdown of a banana photo.
+class ColorAnalysisResult {
+  final BananaColor primary;
+  final double greenFraction;
+  final double yellowFraction;
+  final double blackFraction;
+
+  const ColorAnalysisResult({
+    required this.primary,
+    required this.greenFraction,
+    required this.yellowFraction,
+    required this.blackFraction,
+  });
+
+  factory ColorAnalysisResult.unknown() => const ColorAnalysisResult(
+        primary: BananaColor.unknown,
+        greenFraction: 0,
+        yellowFraction: 0,
+        blackFraction: 0,
+      );
+}
 
 class DetectionResult {
   final String label;
