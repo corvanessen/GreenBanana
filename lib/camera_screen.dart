@@ -648,6 +648,36 @@ Color _colorValue(BananaColor c) {
 
 // ─── Kleur resultaat card ────────────────────────────────────────────────────
 
+/// Kleurverloop van de rijpheidsschaal: groen (1) -> geel (7) -> bruin (8).
+const List<Color> _ripenessGradient = [
+  Color(0xFF3F8F3A), // 1 - donkergroen
+  Color(0xFF6BAF3C), // 2
+  Color(0xFF9CC23F), // 3
+  Color(0xFFC9D640), // 4
+  Color(0xFFE9D93C), // 5
+  Color(0xFFF5C518), // 6
+  Color(0xFFE0A500), // 7 - vol geel
+  Color(0xFF6B4423), // 8 - overrijp/bruin
+];
+
+Color _colorForStage(double stage) {
+  final clamped = stage.clamp(1.0, 8.0);
+  final idx = (clamped - 1).floor().clamp(0, _ripenessGradient.length - 2);
+  final t = clamped - 1 - idx;
+  return Color.lerp(_ripenessGradient[idx], _ripenessGradient[idx + 1], t)!;
+}
+
+String _stageDescription(double stage) {
+  if (stage <= 1.4) return 'Groen — nog niet rijp, wacht een paar dagen';
+  if (stage <= 2.4) return 'Groen-geel — bijna zo ver';
+  if (stage <= 3.4) return 'Lichtgeel met groen — nog iets te vroeg';
+  if (stage <= 4.4) return 'Overwegend geel — bijna perfect';
+  if (stage <= 5.4) return 'Geel — mooi rijp';
+  if (stage <= 6.6) return 'Volledig geel — optimaal rijp';
+  if (stage <= 7.4) return 'Geel met bruine spikkels — heel rijp, lekker zoet';
+  return 'Bruin/overrijp — perfect voor bananenbrood';
+}
+
 class _ColorResultCard extends StatelessWidget {
   final ColorAnalysisResult result;
   const _ColorResultCard({required this.result});
@@ -655,27 +685,30 @@ class _ColorResultCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final primary = result.primary;
-    final accentColor = _colorValue(primary);
-    final label = _colorLabel(primary);
+    final stage = result.ripenessStage;
+    final accentColor = primary == BananaColor.unknown
+        ? _colorValue(primary)
+        : _colorForStage(stage);
 
-    // Build the segmented bar — only show segments with meaningful fraction
-    final segments = <_BarSegment>[
-      if (result.greenFraction > 0.02)
-        _BarSegment(fraction: result.greenFraction, color: const Color(0xFF66BB6A)),
-      if (result.yellowFraction > 0.02)
-        _BarSegment(fraction: result.yellowFraction, color: const Color(0xFFFFD600)),
-      if (result.blackFraction > 0.02)
-        _BarSegment(fraction: result.blackFraction, color: const Color(0xFF666666)),
-    ];
+    if (primary == BananaColor.unknown) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.5),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: accentColor.withValues(alpha: 0.6), width: 1.5),
+        ),
+        child: Text(
+          _colorLabel(primary),
+          style: TextStyle(color: accentColor, fontSize: 16, fontWeight: FontWeight.w600),
+        ),
+      );
+    }
 
-    // Normalise fractions to fill the bar completely
-    final total = segments.fold(0.0, (s, seg) => s + seg.fraction);
-    final normSegments = total > 0
-        ? segments.map((s) => _BarSegment(fraction: s.fraction / total, color: s.color)).toList()
-        : segments;
+    final displayStage = stage.clamp(1.0, 8.0);
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 14),
       decoration: BoxDecoration(
         color: Colors.black.withValues(alpha: 0.5),
         borderRadius: BorderRadius.circular(12),
@@ -684,77 +717,68 @@ class _ColorResultCard extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          // Primary label
+          // Stadium label
           Text(
-            label,
+            displayStage <= 7.0
+                ? 'Rijpheid: stadium ${displayStage.toStringAsFixed(1)} / 7'
+                : 'Overrijp',
             style: TextStyle(
               color: accentColor,
               fontSize: 16,
-              fontWeight: FontWeight.w600,
+              fontWeight: FontWeight.w700,
             ),
           ),
-          // Only show the distribution bar when we have real data
-          if (result.primary != BananaColor.unknown && normSegments.isNotEmpty) ...[
-            const SizedBox(height: 10),
-            // Percentage labels
-            Row(
+          const SizedBox(height: 4),
+          Text(
+            _stageDescription(displayStage),
+            style: const TextStyle(
+              color: Color(0xFFCCCCCC),
+              fontSize: 12,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 10),
+
+          // Gradient schaal met marker
+          SizedBox(
+            width: 220,
+            height: 22,
+            child: Stack(
+              clipBehavior: Clip.none,
               children: [
-                if (result.greenFraction > 0.05)
-                  Expanded(
-                    flex: (result.greenFraction * 100).round(),
-                    child: Text(
-                      '${(result.greenFraction * 100).round()}% 🟢',
-                      style: const TextStyle(fontSize: 10, color: Color(0xFF66BB6A)),
-                      textAlign: TextAlign.center,
+                ClipRRect(
+                  borderRadius: BorderRadius.circular(5),
+                  child: Container(
+                    height: 10,
+                    margin: const EdgeInsets.only(top: 6),
+                    decoration: const BoxDecoration(
+                      gradient: LinearGradient(colors: _ripenessGradient),
                     ),
                   ),
-                if (result.yellowFraction > 0.05)
-                  Expanded(
-                    flex: (result.yellowFraction * 100).round(),
-                    child: Text(
-                      '${(result.yellowFraction * 100).round()}% 🟡',
-                      style: const TextStyle(fontSize: 10, color: Color(0xFFFFD600)),
-                      textAlign: TextAlign.center,
+                ),
+                Positioned(
+                  left: (displayStage - 1) / 7 * (220 - 14),
+                  top: 0,
+                  child: Container(
+                    width: 14,
+                    height: 22,
+                    decoration: BoxDecoration(
+                      color: Colors.white,
+                      borderRadius: BorderRadius.circular(4),
+                      border: Border.all(color: accentColor, width: 2),
+                      boxShadow: const [
+                        BoxShadow(color: Colors.black54, blurRadius: 3),
+                      ],
                     ),
                   ),
-                if (result.blackFraction > 0.05)
-                  Expanded(
-                    flex: (result.blackFraction * 100).round(),
-                    child: Text(
-                      '${(result.blackFraction * 100).round()}% ⚫',
-                      style: const TextStyle(fontSize: 10, color: Color(0xFF888888)),
-                      textAlign: TextAlign.center,
-                    ),
-                  ),
+                ),
               ],
             ),
-            const SizedBox(height: 4),
-            // Segmented colour bar
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: SizedBox(
-                height: 8,
-                child: Row(
-                  children: normSegments
-                      .map((seg) => Expanded(
-                            flex: (seg.fraction * 1000).round(),
-                            child: Container(color: seg.color),
-                          ))
-                      .toList(),
-                ),
-              ),
-            ),
-          ],
+          ),
         ],
       ),
     );
   }
-}
-
-class _BarSegment {
-  final double fraction;
-  final Color color;
-  const _BarSegment({required this.fraction, required this.color});
 }
 
 // ─── Loading & error views ────────────────────────────────────────────────────

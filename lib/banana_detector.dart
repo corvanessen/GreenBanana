@@ -107,22 +107,53 @@ class BananaDetector {
     }
   }
 
+  // Hue-ankerpunten gemeten op een echte rijpheidsschaal (stadium 1 = groen
+  // ... stadium 7 = volledig geel). Hue daalt vrij lineair per segment naarmate
+  // de banaan rijpt, dus we interpoleren tussen deze gemeten punten.
+  static const List<List<double>> _ripenessAnchors = [
+    [90.0, 1.0],
+    [70.0, 2.0],
+    [54.0, 3.0],
+    [49.0, 4.0],
+    [47.0, 5.0],
+    [44.0, 6.0],
+    [40.0, 7.0],
+  ];
+
+  double _hueToRipeness(double hue) {
+    // Boven het hoogste ankerpunt (zeer groen) -> stadium 1
+    if (hue >= _ripenessAnchors.first[0]) return 1.0;
+    // Onder het laagste ankerpunt (diep geel/bruinverkleurend) -> stadium 7
+    if (hue <= _ripenessAnchors.last[0]) return 7.0;
+
+    for (int i = 0; i < _ripenessAnchors.length - 1; i++) {
+      final h1 = _ripenessAnchors[i][0];
+      final s1 = _ripenessAnchors[i][1];
+      final h2 = _ripenessAnchors[i + 1][0];
+      final s2 = _ripenessAnchors[i + 1][1];
+      if (hue <= h1 && hue >= h2) {
+        final t = (h1 - hue) / (h1 - h2);
+        return s1 + t * (s2 - s1);
+      }
+    }
+    return 4.0; // fallback, zou niet moeten gebeuren
+  }
+
   Future<ColorAnalysisResult> analyzePhotoColor(String imagePath) async {
     try {
       final bytes = await File(imagePath).readAsBytes();
       final decoded = img.decodeImage(bytes);
       if (decoded == null) return ColorAnalysisResult.unknown();
 
-      // Scan the central 40% of the image to avoid background
+      // Scan de centrale 40% van de foto om achtergrond te vermijden
       final startX = (decoded.width * 0.30).toInt();
       final endX   = (decoded.width * 0.70).toInt();
       final startY = (decoded.height * 0.30).toInt();
       final endY   = (decoded.height * 0.70).toInt();
 
-      int greenPixels  = 0;
-      int yellowPixels = 0;
-      int blackPixels  = 0;
-      int validPixels  = 0;
+      final List<double> hues = [];
+      int darkSpotPixels = 0; // bruine/zwarte vlekken (overrijp)
+      int validPixels = 0;
 
       for (int y = startY; y < endY; y += 6) {
         for (int x = startX; x < endX; x += 6) {
@@ -135,72 +166,81 @@ class BananaDetector {
           final minVal = [r, g, b].reduce((a, c) => a < c ? a : c);
           final delta  = maxVal - minVal;
 
-          // Skip near-black, near-white, and near-grey pixels
-          if (maxVal < 0.12 || delta < 0.06) continue;
-
-          // Compute HSV hue
-          double hue = 0;
-          if (delta > 0) {
-            if (maxVal == r) {
-              hue = 60 * (((g - b) / delta) % 6);
-            } else if (maxVal == g) {
-              hue = 60 * (((b - r) / delta) + 2);
-            } else {
-              hue = 60 * (((r - g) / delta) + 4);
-            }
-            if (hue < 0) hue += 360;
-          }
-
+          // Achtergrond (bijna wit/crème): hoge helderheid, lage saturatie
           final sat = maxVal == 0 ? 0.0 : delta / maxVal;
+          if (maxVal > 0.85 && sat < 0.25) continue;
 
-          // Only keep banana-spectrum hues (yellow-green range) and dark pixels
-          // Dark/brown pixels (overripe): low brightness regardless of hue
-          if (maxVal < 0.35 && sat < 0.5) {
-            blackPixels++;
+          // Bruine/zwarte vlekken (overrijp): laag-gemiddelde helderheid,
+          // ongeacht hue. Telt apart mee, niet in de hue-schaal.
+          if (maxVal < 0.35) {
+            darkSpotPixels++;
             validPixels++;
             continue;
           }
 
-          // Green banana: hue 70–150°, saturation can be modest (0.15+)
-          // Yellow banana: hue 30–70°, typically higher saturation
-          // We deliberately lower the saturation threshold for green
-          // because unripe bananas are often more muted in colour.
-          if (hue >= 15 && hue < 150 && sat >= 0.15) {
+          if (delta < 0.04) continue; // grijs/neutraal, geen bruikbare hue
+
+          // HSV hue berekenen
+          double hue;
+          if (maxVal == r) {
+            hue = 60 * (((g - b) / delta) % 6);
+          } else if (maxVal == g) {
+            hue = 60 * (((b - r) / delta) + 2);
+          } else {
+            hue = 60 * (((r - g) / delta) + 4);
+          }
+          if (hue < 0) hue += 360;
+
+          // Alleen banaan-spectrum hues (groen t/m geel) meenemen
+          if (hue >= 30 && hue <= 150) {
+            hues.add(hue);
             validPixels++;
-            if (hue >= 72) {
-              greenPixels++;
-            } else {
-              yellowPixels++;
-            }
           }
         }
       }
 
       if (validPixels < 15) return ColorAnalysisResult.unknown();
 
-      // Pixel fractions
-      final totalColored = greenPixels + yellowPixels + blackPixels;
-      if (totalColored == 0) return ColorAnalysisResult.unknown();
+      final darkFraction = darkSpotPixels / validPixels;
 
-      final greenFrac  = greenPixels  / totalColored;
-      final yellowFrac = yellowPixels / totalColored;
-      final blackFrac  = blackPixels  / totalColored;
+      // Geen kleurpixels gevonden (bijv. volledig overrijp/zwart)
+      if (hues.isEmpty) {
+        if (darkFraction > 0.4) {
+          return ColorAnalysisResult(
+            primary: BananaColor.black,
+            ripenessStage: 8.0,
+            darkSpotFraction: darkFraction,
+          );
+        }
+        return ColorAnalysisResult.unknown();
+      }
 
-      // Derive primary colour
+      // Mediaan is robuuster tegen uitschieters (highlights/schaduw) dan gemiddelde
+      hues.sort();
+      final medianHue = hues[hues.length ~/ 2];
+
+      double stage = _hueToRipeness(medianHue);
+
+      // Veel bruine vlekken duwt het stadium richting overrijp (8),
+      // ook als de onderliggende schil-hue nog geel is.
+      if (darkFraction > 0.15) {
+        final pushedStage = 7.0 + (darkFraction.clamp(0.0, 0.6) / 0.6);
+        stage = stage < pushedStage ? pushedStage : stage;
+      }
+
       BananaColor primary;
-      if (blackFrac > 0.45) {
-        primary = BananaColor.black;
-      } else if (greenFrac > 0.35) {
+      if (stage <= 2.5) {
         primary = BananaColor.green;
-      } else {
+      } else if (stage <= 7.0) {
         primary = BananaColor.yellow;
+      } else {
+        primary = BananaColor.black;
       }
 
       return ColorAnalysisResult(
         primary: primary,
-        greenFraction:  greenFrac,
-        yellowFraction: yellowFrac,
-        blackFraction:  blackFrac,
+        ripenessStage: stage,
+        darkSpotFraction: darkFraction,
       );
 
     } catch (e) {
@@ -264,25 +304,26 @@ class _NamedLabel {
 
 enum BananaColor { green, yellow, black, unknown }
 
-/// Holds the per-pixel colour breakdown of a banana photo.
+/// Resultaat van de rijpheidsanalyse van een banaanfoto.
+///
+/// [ripenessStage] loopt van 1.0 (volledig groen) tot 7.0 (volledig geel),
+/// gekalibreerd op een echte rijpheidsschaal. Waarden boven 7.0 (tot ~8.0)
+/// geven overrijpe/bruin-vlekkige bananen aan.
 class ColorAnalysisResult {
   final BananaColor primary;
-  final double greenFraction;
-  final double yellowFraction;
-  final double blackFraction;
+  final double ripenessStage;
+  final double darkSpotFraction;
 
   const ColorAnalysisResult({
     required this.primary,
-    required this.greenFraction,
-    required this.yellowFraction,
-    required this.blackFraction,
+    required this.ripenessStage,
+    required this.darkSpotFraction,
   });
 
   factory ColorAnalysisResult.unknown() => const ColorAnalysisResult(
         primary: BananaColor.unknown,
-        greenFraction: 0,
-        yellowFraction: 0,
-        blackFraction: 0,
+        ripenessStage: 0,
+        darkSpotFraction: 0,
       );
 }
 
