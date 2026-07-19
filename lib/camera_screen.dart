@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'banana_detector.dart';
-import 'dart:io'; 
+import 'feedback_store.dart';
+import 'dart:io';
 
 class CameraScreen extends StatefulWidget {
   final List<CameraDescription> cameras;
@@ -24,6 +25,8 @@ class _CameraScreenState extends State<CameraScreen>
   String? _errorMessage;
   String? _capturedPhotoPath;
   ColorAnalysisResult? _photoColor;
+  bool _feedbackSubmitted = false;
+  bool _feedbackSubmitting = false;
 
   @override
   void initState() {
@@ -149,8 +152,84 @@ class _CameraScreenState extends State<CameraScreen>
       _photoColor = null;
       _detection = null;
       _isTakingPhoto = false;
+      _feedbackSubmitted = false;
+      _feedbackSubmitting = false;
     });
     await _controller!.startImageStream(_onCameraImage);
+  }
+
+  // ─── Feedback ───────────────────────────────────────────────────────────
+  //
+  // correctedBucket == null betekent "klopt, gebruiker bevestigt het
+  // voorspelde resultaat". Anders is het de kleur-emmer ('green'/'yellow'/
+  // 'black') die de gebruiker als correctie aangeeft. Alles blijft lokaal op
+  // dit toestel (zie feedback_store.dart) — geen backend.
+  Future<void> _submitFeedback(String? correctedBucket) async {
+    if (_feedbackSubmitted || _feedbackSubmitting) return;
+    if (_capturedPhotoPath == null || _photoColor == null || _detector == null) return;
+
+    setState(() => _feedbackSubmitting = true);
+
+    try {
+      final store = _detector!.feedbackStore;
+      final recordId = store.newRecordId();
+      final photoRef = await store.copyPhotoForRecord(_capturedPhotoPath!, recordId);
+      final deviceId = await store.deviceId();
+      final photoColor = _photoColor!;
+
+      final record = FeedbackRecord(
+        recordId: recordId,
+        timestamp: DateTime.now().toIso8601String(),
+        deviceId: deviceId,
+        appVersion: '1.0.0',
+        photoRef: photoRef,
+        boundingBoxSource: photoColor.boxSource,
+        boxLeftFrac: photoColor.boxLeftFrac,
+        boxTopFrac: photoColor.boxTopFrac,
+        boxRightFrac: photoColor.boxRightFrac,
+        boxBottomFrac: photoColor.boxBottomFrac,
+        medianHueRaw: photoColor.medianHueRaw,
+        satMedian: photoColor.satMedian,
+        valMedian: photoColor.valMedian,
+        darkSpotFraction: photoColor.darkSpotFraction,
+        validPixelCount: photoColor.validPixelCount,
+        hueHistogram: photoColor.hueHistogram,
+        predictedStage: photoColor.ripenessStage,
+        predictedColorBucket: _bucketName(photoColor.primary),
+        userConfirmed: correctedBucket == null,
+        correctedStage: correctedBucket == null ? null : _stageForBucket(correctedBucket),
+        correctedColorBucket: correctedBucket,
+      );
+
+      await store.appendRecord(record);
+      if (mounted) {
+        setState(() {
+          _feedbackSubmitted = true;
+          _feedbackSubmitting = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('⚠️ Feedback opslaan mislukt: $e');
+      if (mounted) setState(() => _feedbackSubmitting = false);
+    }
+  }
+
+  static String _bucketName(BananaColor c) {
+    switch (c) {
+      case BananaColor.green:   return 'green';
+      case BananaColor.yellow:  return 'yellow';
+      case BananaColor.black:   return 'black';
+      case BananaColor.unknown: return 'unknown';
+    }
+  }
+
+  static double _stageForBucket(String bucket) {
+    switch (bucket) {
+      case 'green':  return 1.5;
+      case 'yellow': return 4.5;
+      case 'black':  return 7.5;
+      default:       return 4.0;
+    }
   }
 
   @override
@@ -181,6 +260,9 @@ class _CameraScreenState extends State<CameraScreen>
         detection: _detection,
         colorResult: _photoColor ?? ColorAnalysisResult.unknown(),
         onReset: _resetScan,
+        onFeedback: _submitFeedback,
+        feedbackSubmitted: _feedbackSubmitted,
+        feedbackSubmitting: _feedbackSubmitting,
       );
     }
 
@@ -204,12 +286,18 @@ class _PhotoResultView extends StatelessWidget {
   final DetectionResult? detection;
   final ColorAnalysisResult colorResult;
   final VoidCallback onReset;
+  final ValueChanged<String?> onFeedback;
+  final bool feedbackSubmitted;
+  final bool feedbackSubmitting;
 
   const _PhotoResultView({
     required this.photoPath,
     required this.detection,
     required this.colorResult,
     required this.onReset,
+    required this.onFeedback,
+    required this.feedbackSubmitted,
+    required this.feedbackSubmitting,
   });
 
   @override
@@ -222,6 +310,10 @@ class _PhotoResultView extends StatelessWidget {
           File(photoPath),
           fit: BoxFit.cover,
         ),
+
+        // Toont waar de kleuranalyse daadwerkelijk gekeken heeft (echte
+        // gedetecteerde bounding box, of het vaste terugval-vak).
+        _DetectionBoxOverlay(colorResult: colorResult),
 
         // Donkere overlay onderin
         Positioned(
@@ -266,6 +358,15 @@ class _PhotoResultView extends StatelessWidget {
 
                 // Kleur resultaat
                 _ColorResultCard(result: colorResult),
+
+                if (colorResult.primary != BananaColor.unknown)
+                  _FeedbackRow(
+                    predicted: colorResult.primary,
+                    submitted: feedbackSubmitted,
+                    submitting: feedbackSubmitting,
+                    onTap: onFeedback,
+                  ),
+
                 const SizedBox(height: 24),
 
                 // Nieuwe scan knop
@@ -309,6 +410,230 @@ class _PhotoResultView extends StatelessWidget {
           ),
         ),
       ],
+    );
+  }
+}
+
+// ─── Gedetecteerde scan-regio (echte box of terugval-vak) ────────────────────
+
+class _DetectionBoxOverlay extends StatelessWidget {
+  final ColorAnalysisResult colorResult;
+  const _DetectionBoxOverlay({required this.colorResult});
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return CustomPaint(
+          size: Size(constraints.maxWidth, constraints.maxHeight),
+          painter: _DetectionBoxPainter(
+            imageAspectRatio: colorResult.imageAspectRatio,
+            leftFrac: colorResult.boxLeftFrac,
+            topFrac: colorResult.boxTopFrac,
+            rightFrac: colorResult.boxRightFrac,
+            bottomFrac: colorResult.boxBottomFrac,
+            isRealDetection: colorResult.boxSource == 'mlkit_object_detector',
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _DetectionBoxPainter extends CustomPainter {
+  final double imageAspectRatio;
+  final double leftFrac;
+  final double topFrac;
+  final double rightFrac;
+  final double bottomFrac;
+  final bool isRealDetection;
+
+  _DetectionBoxPainter({
+    required this.imageAspectRatio,
+    required this.leftFrac,
+    required this.topFrac,
+    required this.rightFrac,
+    required this.bottomFrac,
+    required this.isRealDetection,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (size.width <= 0 || size.height <= 0 || imageAspectRatio <= 0) return;
+
+    // Zelfde BoxFit.cover-wiskunde als Image.file(fit: BoxFit.cover) gebruikt,
+    // zodat de box precies over de zichtbare (bijgesneden) foto valt.
+    final containerAspectRatio = size.width / size.height;
+    double scaledWidth, scaledHeight, offsetX, offsetY;
+    if (imageAspectRatio > containerAspectRatio) {
+      scaledHeight = size.height;
+      scaledWidth = size.height * imageAspectRatio;
+      offsetX = (size.width - scaledWidth) / 2;
+      offsetY = 0;
+    } else {
+      scaledWidth = size.width;
+      scaledHeight = size.width / imageAspectRatio;
+      offsetX = 0;
+      offsetY = (size.height - scaledHeight) / 2;
+    }
+
+    final rect = Rect.fromLTRB(
+      offsetX + leftFrac * scaledWidth,
+      offsetY + topFrac * scaledHeight,
+      offsetX + rightFrac * scaledWidth,
+      offsetY + bottomFrac * scaledHeight,
+    );
+
+    final paint = Paint()
+      ..color = (isRealDetection ? const Color(0xFFD4E84A) : const Color(0xFF999999))
+          .withValues(alpha: 0.9)
+      ..strokeWidth = 2.5
+      ..style = PaintingStyle.stroke;
+
+    canvas.drawRRect(RRect.fromRectAndRadius(rect, const Radius.circular(12)), paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _DetectionBoxPainter old) =>
+      old.leftFrac != leftFrac ||
+      old.topFrac != topFrac ||
+      old.rightFrac != rightFrac ||
+      old.bottomFrac != bottomFrac ||
+      old.imageAspectRatio != imageAspectRatio ||
+      old.isRealDetection != isRealDetection;
+}
+
+// ─── Feedback: klopt dit resultaat? ───────────────────────────────────────────
+
+class _FeedbackRow extends StatelessWidget {
+  final BananaColor predicted;
+  final bool submitted;
+  final bool submitting;
+  final ValueChanged<String?> onTap;
+
+  const _FeedbackRow({
+    required this.predicted,
+    required this.submitted,
+    required this.submitting,
+    required this.onTap,
+  });
+
+  String? get _predictedBucket {
+    switch (predicted) {
+      case BananaColor.green:   return 'green';
+      case BananaColor.yellow:  return 'yellow';
+      case BananaColor.black:   return 'black';
+      case BananaColor.unknown: return null;
+    }
+  }
+
+  String _labelFor(String bucket) {
+    switch (bucket) {
+      case 'green':  return '🟢 G';
+      case 'yellow': return '🟡 Y';
+      default:       return '⚫';
+    }
+  }
+
+  // Effen, herkenbare knopkleur per emmer i.p.v. de neutrale grijze outline
+  // van voorheen — groen bewust donkerder dan de rest zodat de knop niet
+  // wegvalt tegen een gele/groene achtergrondfoto. Voorgrondkleur per knop
+  // gekozen op leesbaarheid (wit op donker, donker op het lichte geel).
+  ({Color background, Color foreground}) _styleFor(String bucket) {
+    switch (bucket) {
+      case 'green':  return (background: const Color(0xFF1B5E20), foreground: Colors.white);
+      case 'yellow': return (background: const Color(0xFFFFC400), foreground: const Color(0xFF3A2E00));
+      default:       return (background: const Color(0xFF3A3A3A), foreground: Colors.white);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (submitted) {
+      return const Padding(
+        padding: EdgeInsets.only(top: 10),
+        child: Text(
+          'Bedankt voor je feedback! 🙏',
+          style: TextStyle(color: Color(0xFFD4E84A), fontSize: 12),
+        ),
+      );
+    }
+
+    const buckets = ['green', 'yellow', 'black'];
+    final predictedBucket = _predictedBucket;
+
+    return Padding(
+      padding: const EdgeInsets.only(top: 10),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Text(
+            'Klopt dit rijpheidsniveau?',
+            style: TextStyle(color: Color(0xFF999999), fontSize: 11),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              _FeedbackChip(
+                label: '✓ Klopt',
+                background: const Color(0xFFD4E84A).withValues(alpha: 0.15),
+                foreground: const Color(0xFFD4E84A),
+                onTap: submitting ? null : () => onTap(null),
+              ),
+              for (final bucket in buckets)
+                if (bucket != predictedBucket)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 8),
+                    child: _FeedbackChip(
+                      label: _labelFor(bucket),
+                      background: _styleFor(bucket).background,
+                      foreground: _styleFor(bucket).foreground,
+                      onTap: submitting ? null : () => onTap(bucket),
+                    ),
+                  ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _FeedbackChip extends StatelessWidget {
+  final String label;
+  final Color background;
+  final Color foreground;
+  final VoidCallback? onTap;
+
+  const _FeedbackChip({
+    required this.label,
+    required this.background,
+    required this.foreground,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      borderRadius: BorderRadius.circular(20),
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: background,
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: foreground.withValues(alpha: 0.6), width: 1.5),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            color: foreground,
+            fontSize: 13,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
     );
   }
 }
